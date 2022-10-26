@@ -12,6 +12,8 @@ from typing import Iterable, List, Optional, TypeVar, Type, Tuple, Dict, Union
 
 import imaplib
 
+import msal
+
 from googleapiclient.discovery import build, Resource
 from googleapiclient.errors import HttpError
 from google.auth.exceptions import RefreshError
@@ -21,6 +23,7 @@ from google.oauth2.credentials import Credentials
 
 from django.conf import settings
 from django.utils.text import slugify
+
 
 from pydantic import BaseModel  # pylint: disable=no-name-in-module
 from pydantic.error_wrappers import ValidationError  # pylint: disable=no-name-in-module
@@ -123,15 +126,39 @@ class Source(BaseModel):
         url_components = urlparse(url)
         scheme = url_components.scheme.lower()
         if scheme == "imap":
-            return IMAP(
-                name=name,
-                url=url,
-                account=config.get("account"),
-                password=config.get("secret"),
-                imap_server=url_components.netloc.split(":")[0],
-                imap_port=url_components.port or 993,
-                source_header=config.get("source_header", "From"),
-            )
+            if config.get("auth_type", "") == "msal":
+                creds_filename = config.get("credentials_file")
+
+            if not creds_filename:
+                raise ValueError(f"Credentials_file for {name} not found in PLUGINS_CONFIG.")
+
+            if not os.path.isfile(creds_filename):
+                raise ValueError(f"Credentials_file {creds_filename} for {name} is not available.")
+
+            with open(creds_filename, encoding="utf-8") as credentials_file:
+                credentials = json.load(credentials_file)
+
+                return O365ImapOAuth(
+                    name=name,
+                    url=url,
+                    scope=config.get("scope"),
+                    client_id=config.get("client_id")
+                    authority=config.get("authority")
+                    account=config.get("account"),
+                    imap_server = url_components.netloc.split(":")[0],
+                    imap_port = url_components.port or 993,
+                    source_header = config.get("source-header", "From"),
+                )
+            else:
+                return IMAP(
+                    name=name,
+                    url=url,
+                    account=config.get("account"),
+                    password=config.get("secret"),
+                    imap_server=url_components.netloc.split(":")[0],
+                    imap_port=url_components.port or 993,
+                    source_header=config.get("source_header", "From"),
+                )
         if scheme == "https" and url_components.netloc.split(":")[0] == "accounts.google.com":
             creds_filename = config.get("credentials_file")
             if not creds_filename:
@@ -410,6 +437,46 @@ class IMAP(EmailSource):
 
         self.close_session()
         return received_notifications
+
+class O365ImapOAuth(IMAP):
+    scope: str
+    client_id: str
+    authority: str
+    secret: str
+
+    def open_session(self):
+        """Open session to IMAP server.
+
+        See states: https://github.com/python/cpython/blob/3.9/Lib/imaplib.py#L58
+        """
+        def generate_oauth_string(username, token):
+            return f"user={username}\1auth=Bearer {token}\1\1"
+
+        app = msal.ConfidentialClientApplication(
+            self.client_id,
+            authority=self.authority,
+            client_credential=self.secret,
+        )
+
+        # check if there's a valid token in the in memory cache
+        result = None
+        result = app.acquire_token_silent([self.scope], account=None)
+
+        if not result:
+            result = app.acquire_token_for_client(scopes=self.scope)
+
+        try:
+            token = result["access_token"]
+        except KeyError:
+            raise RuntimeError("Unable to retrieve access token")
+
+        auth_string = generate_oauth_string(self.username, token)
+            
+        if not self.session:
+            self.session = imaplib.IMAP4_SSL(self.imap_server, self.imap_port)
+
+        if self.session.state == "NONAUTH":
+            self.session.authenticate("XOAUTH2", lambda x: auth_string)
 
 
 class GmailAPI(EmailSource):
